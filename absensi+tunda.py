@@ -12,10 +12,10 @@ BASE_URL = "https://naradaya.adhimix.web.id/"
 USERNAME = "11235"  # <-- ganti username
 PASSWORD = "sep"    # <-- ganti password
 
-PAGI_START = (6, 0)    # 06:00
+PAGI_START = (7, 0)    # 07:00
 PAGI_END   = (7, 45)   # 07:45
 SORE_START = (17, 55)  # 17:55
-SORE_END   = (20, 10)  # 20:10
+SORE_END   = (19, 30)  # 19:30
 
 LOG_FILE = "absensi_log.txt"
 
@@ -301,4 +301,5 @@ def main():
         time.sleep(max(0, tunggu))
 
 if __name__ == "__main__":
+
     main()
