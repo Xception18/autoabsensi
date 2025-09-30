@@ -9,8 +9,8 @@ import sys
 
 # ======== KONFIGURASI =========
 BASE_URL = "https://naradaya.adhimix.web.id/"
-USERNAME = "11235"  # <-- ganti username
-PASSWORD = "sep"    # <-- ganti password
+USERNAME = "useid"  # <-- ganti username
+PASSWORD = "password"    # <-- ganti password
 
 PAGI_START = (7, 0)    # 07:00
 PAGI_END   = (7, 45)   # 07:45
@@ -302,4 +302,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
