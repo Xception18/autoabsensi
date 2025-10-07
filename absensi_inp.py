@@ -1,4 +1,467 @@
+import requests
+from datetime import datetime, timedelta
+import random
+import time
+import os
+import json
+import threading
+import sys
+from requests.exceptions import ConnectionError, Timeout, RequestException
+import getpass
 
-# Python obfuscation by freecodingtools.org
+# ======== KONFIGURASI =========
+BASE_URL = "https://naradaya.adhimix.web.id/"
+
+# Username dan password akan diinput saat script dijalankan
+USERNAME = ""
+PASSWORD = ""
+
+PAGI_START = (7, 45)    # 07:00
+PAGI_END   = (8, 15)   # 07:45
+SORE_START = (17, 10)  # 17:10
+SORE_END   = (18, 00)  # 18:00
+
+LOG_FILE = "absensi_log.txt"
+
+# Status global untuk tunda absensi
+TUNDA_ABSENSI = False
+TANGGAL_TUNDA = None
+
+# Konfigurasi retry dan timeout
+MAX_RETRY = 540
+RETRY_DELAY = 30  # detik
+REQUEST_TIMEOUT = 30  # detik
+
+# ======== FUNGSI INPUT KREDENSIAL =========
+def input_kredensial():
+    """Meminta input username dan password dari pengguna"""
+    global USERNAME, PASSWORD
+    
+    print("=" * 50)
+    print("BOT ABSENSI OTOMATIS - LOGIN")
+    print("=" * 50)
+    
+    USERNAME = input("Masukkan Username: ").strip()
+    
+    # Gunakan getpass untuk menyembunyikan password saat diketik
+    try:
+        PASSWORD = getpass.getpass("Masukkan Password: ").strip()
+    except:
+        # Fallback jika getpass tidak tersedia
+        PASSWORD = input("Masukkan Password: ").strip()
+    
+    if not USERNAME or not PASSWORD:
+        print("[ERROR] Username dan password tidak boleh kosong!")
+        sys.exit(1)
+    
+    print(f"\n[INFO] Login sebagai: {USERNAME}")
+    print("[INFO] Memverifikasi kredensial...")
+    
+    # Verifikasi login
+    if not verifikasi_login():
+        print("[ERROR] Login gagal! Username atau password salah.")
+        print("[ABORT] Program dihentikan.")
+        sys.exit(1)
+    
+    print("[SUCCESS] Login berhasil diverifikasi!")
+    print("=" * 50)
+    print()
+
+# ======== VERIFIKASI LOGIN =========
+def verifikasi_login():
+    """Verifikasi kredensial login ke server"""
+    try:
+        session = requests.Session()
+        login_payload = {
+            "login": USERNAME,
+            "password": PASSWORD
+        }
+        
+        login_url = BASE_URL + "login/confirm"
+        res = session.post(login_url, data=login_payload, timeout=REQUEST_TIMEOUT)
+        
+        if "gagal" in res.text.lower():
+            return False
+        
+        return True
+        
+    except Exception as e:
+        print(f"[ERROR] Tidak dapat terhubung ke server: {str(e)}")
+        return False
+
+# ======== FUNGSI RANDOM JAM =========
+def random_jam(start_tuple, end_tuple):
+    today = datetime.now().date()
+    start_time = datetime.combine(today, datetime.min.time()).replace(hour=start_tuple[0], minute=start_tuple[1])
+    end_time   = datetime.combine(today, datetime.min.time()).replace(hour=end_tuple[0], minute=end_tuple[1])
+
+    delta_seconds = int((end_time - start_time).total_seconds())
+    random_seconds = random.randint(0, delta_seconds)
+    return start_time + timedelta(seconds=random_seconds)
+
+# ======== SIMPAN LOG =========
+def tulis_log(pesan):
+    waktu = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    log_message = f"{waktu} {pesan}"
+    
+    # Tulis ke file dengan encoding UTF-8
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{log_message}\n")
+    except Exception as e:
+        # Fallback: tulis tanpa karakter khusus
+        safe_message = log_message.encode('ascii', 'ignore').decode('ascii')
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{safe_message}\n")
+    
+    print(log_message, flush=True)
+
+# ======== CEK KONEKSI INTERNET =========
+def cek_koneksi_internet():
+    """Cek apakah ada koneksi internet"""
+    try:
+        # Test dengan Google DNS yang lebih reliable
+        response = requests.get("https://8.8.8.8", timeout=5)
+        return True
+    except:
+        try:
+            # Backup test dengan cloudflare DNS
+            response = requests.get("https://1.1.1.1", timeout=5)
+            return True
+        except:
+            try:
+                # Test dengan website utama
+                response = requests.get(BASE_URL, timeout=10)
+                return True
+            except:
+                return False
+
+# ======== FUNGSI RETRY DENGAN ERROR HANDLING =========
+def execute_with_retry(func, *args, **kwargs):
+    """Eksekusi fungsi dengan retry otomatis jika ada error jaringan"""
+    for attempt in range(MAX_RETRY):
+        try:
+            return func(*args, **kwargs)
+        except (ConnectionError, Timeout, RequestException) as e:
+            error_msg = str(e)
+            if "NameResolutionError" in error_msg or "No address associated with hostname" in error_msg:
+                tulis_log(f"[NETWORK ERROR] Tidak dapat resolve hostname (attempt {attempt + 1}/{MAX_RETRY})")
+            elif "ConnectionError" in error_msg:
+                tulis_log(f"[NETWORK ERROR] Koneksi gagal (attempt {attempt + 1}/{MAX_RETRY})")
+            elif "Timeout" in error_msg:
+                tulis_log(f"[NETWORK ERROR] Request timeout (attempt {attempt + 1}/{MAX_RETRY})")
+            else:
+                tulis_log(f"[NETWORK ERROR] {error_msg} (attempt {attempt + 1}/{MAX_RETRY})")
+            
+            if attempt < MAX_RETRY - 1:
+                tulis_log(f"[RETRY] Menunggu {RETRY_DELAY} detik sebelum retry...")
+                time.sleep(RETRY_DELAY)
+            else:
+                tulis_log(f"[FAILED] Gagal setelah {MAX_RETRY} percobaan")
+                return None
+        except Exception as e:
+            tulis_log(f"[UNEXPECTED ERROR] {str(e)} (attempt {attempt + 1}/{MAX_RETRY})")
+            if attempt < MAX_RETRY - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                return None
+    return None
+
+# ======== FUNGSI INPUT TUNDA =========
+def input_listener():
+    """Thread untuk mendengar input pengguna"""
+    global TUNDA_ABSENSI, TANGGAL_TUNDA
+    
+    while True:
+        try:
+            user_input = input().strip().lower()
+            
+            if user_input == "tunda":
+                hari_ini = datetime.now().date()
+                TANGGAL_TUNDA = hari_ini
+                TUNDA_ABSENSI = True
+                tulis_log(f"[TUNDA] Absensi hari ini ({hari_ini}) ditunda!")
+                tulis_log("[INFO] Ketik 'status' untuk melihat status tunda, atau 'batal' untuk membatalkan tunda.")
+                
+            elif user_input == "status":
+                if TUNDA_ABSENSI and TANGGAL_TUNDA:
+                    tulis_log(f"[STATUS] Absensi ditunda untuk tanggal: {TANGGAL_TUNDA}")
+                else:
+                    tulis_log("[STATUS] Tidak ada absensi yang ditunda")
                     
-_ = lambda __ : __import__('zlib').decompress(__import__('base64').b64decode(__[::-1]));exec((_)(b'=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'))
+            elif user_input == "batal":
+                if TUNDA_ABSENSI:
+                    TUNDA_ABSENSI = False
+                    TANGGAL_TUNDA = None
+                    tulis_log("[BATAL] Tunda absensi dibatalkan!")
+                else:
+                    tulis_log("[INFO] Tidak ada tunda absensi yang aktif")
+                    
+            elif user_input == "test":
+                tulis_log("[TEST] Testing koneksi internet...")
+                if cek_koneksi_internet():
+                    tulis_log("[TEST] ✓ Koneksi internet OK")
+                else:
+                    tulis_log("[TEST] ✗ Tidak ada koneksi internet")
+                    
+            elif user_input == "help":
+                tulis_log("[HELP] Perintah yang tersedia:")
+                tulis_log("  - tunda : Tunda absensi hari ini")
+                tulis_log("  - status : Lihat status tunda")
+                tulis_log("  - batal : Batalkan tunda absensi")
+                tulis_log("  - test : Test koneksi internet")
+                tulis_log("  - help : Tampilkan bantuan ini")
+                tulis_log("  - exit : Keluar dari program")
+                
+            elif user_input == "exit":
+                tulis_log("[EXIT] Program dihentikan oleh pengguna")
+                os._exit(0)
+                
+        except (EOFError, KeyboardInterrupt):
+            break
+        except Exception as e:
+            tulis_log(f"[ERROR] Error pada input listener: {str(e)}")
+
+def cek_tunda_absensi():
+    """Cek apakah hari ini absensi ditunda"""
+    global TUNDA_ABSENSI, TANGGAL_TUNDA
+    
+    hari_ini = datetime.now().date()
+    
+    if TUNDA_ABSENSI and TANGGAL_TUNDA == hari_ini:
+        return True
+    
+    # Reset tunda jika tanggalnya sudah lewat
+    if TANGGAL_TUNDA and hari_ini > TANGGAL_TUNDA:
+        TUNDA_ABSENSI = False
+        TANGGAL_TUNDA = None
+        tulis_log("[INFO] Reset status tunda karena tanggal sudah lewat")
+    
+    return False
+
+# ======== CEK STATUS ABSENSI HARI INI =========
+def cek_status_absensi():
+    """
+    Mengecek status absensi hari ini dari API
+    Return: dict dengan status jam_datang dan jam_pulang
+    """
+    def _cek_status():
+        session = requests.Session()
+        
+        # Login dulu
+        login_payload = {
+            "login": USERNAME,
+            "password": PASSWORD
+        }
+        login_url = BASE_URL + "login/confirm"
+        res = session.post(login_url, data=login_payload, timeout=REQUEST_TIMEOUT)
+        
+        if "gagal" in res.text.lower():
+            tulis_log("[ERROR] Login gagal saat cek status absensi")
+            return None
+            
+        # Ambil data history absensi
+        history_url = BASE_URL + "absensi/history/kemarin"
+        history_res = session.get(history_url, timeout=REQUEST_TIMEOUT)
+        
+        if history_res.status_code != 200:
+            tulis_log(f"[ERROR] Gagal mengambil data history: {history_res.status_code}")
+            return None
+            
+        data = json.loads(history_res.text)
+        hari_ini = datetime.now().strftime("%Y-%m-%d")
+        
+        # Cari data hari ini
+        for record in data:
+            tanggal_record = record.get('tanggal', '').split(' ')[0]  # Ambil tanggal saja
+            if tanggal_record == hari_ini:
+                tulis_log(f"[INFO] Data absensi hari ini: jam_datang={record.get('jam_datang')}, jam_pulang={record.get('jam_pulang')}")
+                return {
+                    'jam_datang': record.get('jam_datang'),
+                    'jam_pulang': record.get('jam_pulang')
+                }
+        
+        # Jika tidak ada data hari ini
+        tulis_log("[INFO] Belum ada data absensi untuk hari ini")
+        return {'jam_datang': None, 'jam_pulang': None}
+    
+    return execute_with_retry(_cek_status)
+
+# ======== LOGIN & ABSEN =========
+def login_dan_absen(sesi):
+    def _login_dan_absen():
+        session = requests.Session()
+        login_payload = {
+            "login": USERNAME,
+            "password": PASSWORD
+        }
+
+        login_url = BASE_URL + "login/confirm"
+        res = session.post(login_url, data=login_payload, timeout=REQUEST_TIMEOUT)
+
+        if "gagal" in res.text.lower():
+            tulis_log(f"[ERROR] Login gagal untuk sesi {sesi}")
+            return False
+
+        tulis_log(f"[SUCCESS] Login sukses untuk sesi {sesi}")
+
+        absen_url = BASE_URL + "absensi/hit"
+        absen_payload = {}
+        absen_res = session.post(absen_url, data=absen_payload, timeout=REQUEST_TIMEOUT)
+
+        tulis_log(f"[RESPONSE] Response absensi ({sesi}): {absen_res.text.strip()}")
+        return True
+    
+    result = execute_with_retry(_login_dan_absen)
+    return result if result is not None else False
+
+# ======== WAIT WITH NETWORK CHECK =========
+def wait_with_network_check(target_time, check_interval=300):
+    """
+    Menunggu sampai waktu target dengan cek jaringan berkala
+    check_interval: interval cek jaringan dalam detik (default 5 menit)
+    """
+    last_network_check = 0
+    
+    while datetime.now() < target_time:
+        if cek_tunda_absensi():
+            tulis_log("[TUNDA] Absensi ditunda saat menunggu")
+            return False
+            
+        current_time = time.time()
+        
+        # Cek jaringan setiap check_interval
+        if current_time - last_network_check >= check_interval:
+            if not cek_koneksi_internet():
+                tulis_log("[WARNING] Tidak ada koneksi internet, tetap menunggu...")
+            last_network_check = current_time
+            
+        time.sleep(30)
+    
+    return True
+
+# ======== PROSES ABSENSI PER HARI =========
+def absensi_harian():
+    # Cek apakah absensi hari ini ditunda
+    if cek_tunda_absensi():
+        tulis_log("[TUNDA] Absensi hari ini ditunda. Skip absensi.")
+        return
+        
+    hari_ini = datetime.now().strftime("%A").lower()
+    hari_allowed = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+
+    if hari_ini not in hari_allowed:
+        tulis_log(f"[SKIP] Hari ini ({hari_ini.capitalize()}) bukan jadwal absensi.")
+        return
+
+    tulis_log(f"[INFO] Hari ini: {hari_ini.capitalize()}")
+    
+    # Cek koneksi internet dulu
+    if not cek_koneksi_internet():
+        tulis_log("[WARNING] Tidak ada koneksi internet, akan retry nanti...")
+        return
+    
+    # Cek status absensi saat ini
+    status = cek_status_absensi()
+    if status is None:
+        tulis_log("[ERROR] Tidak dapat mengecek status absensi karena masalah jaringan, skip hari ini")
+        return
+    
+    jam_datang = status.get('jam_datang')
+    jam_pulang = status.get('jam_pulang')
+    
+    waktu_pagi = random_jam(PAGI_START, PAGI_END)
+    waktu_sore = random_jam(SORE_START, SORE_END)
+    
+    tulis_log(f"[SCHEDULE] Jadwal absen pagi: {waktu_pagi.strftime('%H:%M:%S')}")
+    tulis_log(f"[SCHEDULE] Jadwal absen sore: {waktu_sore.strftime('%H:%M:%S')}")
+
+    # Logika berdasarkan status absensi
+    if jam_datang is None:
+        # Belum absen masuk, tunggu jadwal pagi
+        tulis_log("[WAITING] Status: Belum absen masuk, menunggu waktu absen pagi...")
+        if not wait_with_network_check(waktu_pagi):
+            return
+        
+        if cek_tunda_absensi():  # Cek sekali lagi sebelum absen
+            tulis_log("[TUNDA] Absensi ditunda sebelum eksekusi pagi")
+            return
+            
+        tulis_log("[ACTION] Waktu absen pagi tiba!")
+        if not login_dan_absen("Pagi"):
+            tulis_log("[FAILED] Gagal absen pagi karena masalah jaringan")
+            return
+        
+        # Setelah absen pagi, tunggu waktu sore
+        tulis_log("[WAITING] Absen pagi selesai, menunggu waktu absen sore...")
+        if not wait_with_network_check(waktu_sore):
+            return
+        
+        if cek_tunda_absensi():  # Cek sekali lagi sebelum absen
+            tulis_log("[TUNDA] Absensi sore ditunda sebelum eksekusi")
+            return
+            
+        tulis_log("[ACTION] Waktu absen sore tiba!")
+        if not login_dan_absen("Sore"):
+            tulis_log("[FAILED] Gagal absen sore karena masalah jaringan")
+            return
+        
+    elif jam_datang is not None and jam_pulang is None:
+        # Sudah absen masuk, belum absen pulang
+        tulis_log(f"[WAITING] Status: Sudah absen masuk ({jam_datang}), belum absen pulang. Menunggu waktu absen sore...")
+        if not wait_with_network_check(waktu_sore):
+            return
+        
+        if cek_tunda_absensi():  # Cek sekali lagi sebelum absen
+            tulis_log("[TUNDA] Absensi sore ditunda sebelum eksekusi")
+            return
+            
+        tulis_log("[ACTION] Waktu absen sore tiba!")
+        if not login_dan_absen("Sore"):
+            tulis_log("[FAILED] Gagal absen sore karena masalah jaringan")
+            return
+        
+    else:
+        # Sudah absen masuk dan pulang
+        tulis_log(f"[COMPLETE] Sudah absen lengkap hari ini - Masuk: {jam_datang}, Pulang: {jam_pulang}")
+        return
+
+    tulis_log("[SUCCESS] Semua absensi hari ini selesai.")
+
+# ======== LOOP OTOMATIS TIAP HARI =========
+def main():
+    # Input kredensial di awal
+    input_kredensial()
+    
+    tulis_log("[START] Bot absensi otomatis dimulai.")
+    tulis_log(f"[INFO] Login sebagai user: {USERNAME}")
+    tulis_log("[INFO] Perintah yang tersedia:")
+    tulis_log("  - Ketik 'tunda' untuk menunda absensi hari ini")
+    tulis_log("  - Ketik 'status' untuk melihat status tunda") 
+    tulis_log("  - Ketik 'batal' untuk membatalkan tunda")
+    tulis_log("  - Ketik 'test' untuk test koneksi internet")
+    tulis_log("  - Ketik 'help' untuk bantuan")
+    tulis_log("  - Ketik 'exit' untuk keluar")
+    tulis_log("[INFO] ========================================")
+    
+    # Jalankan input listener di thread terpisah
+    input_thread = threading.Thread(target=input_listener, daemon=True)
+    input_thread.start()
+    
+    while True:
+        try:
+            absensi_harian()
+        except Exception as e:
+            tulis_log(f"[CRITICAL ERROR] Error tidak terduga: {str(e)}")
+            tulis_log("[INFO] Melanjutkan ke hari berikutnya...")
+
+        # Tunggu sampai hari berikutnya jam 00:05
+        besok = datetime.now().date() + timedelta(days=1)
+        target = datetime.combine(besok, datetime.min.time()) + timedelta(minutes=5)
+        tunggu = (target - datetime.now()).total_seconds()
+
+        tulis_log(f"[WAIT] Menunggu hari berikutnya ({tunggu/3600:.2f} jam)")
+        time.sleep(max(0, tunggu))
+
+if __name__ == "__main__":
+    main()
